@@ -2,7 +2,6 @@ import streamlit as st
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import time
-import random
 import json
 import jieba
 from pypinyin import pinyin, Style
@@ -27,16 +26,31 @@ class Translator:
 
     def __init__(self):
         if not self.initialized:
+            # 1. Lấy API Key
             self.api_key = st.secrets.get("google_genai", {}).get("api_key", "") or st.secrets.get("api_key", "")
-            if self.api_key: genai.configure(api_key=self.api_key)
-            self.model_flash = st.secrets.get("google_genai", {}).get("model_flash", "gemini-2.5-flash")
-            self.model_pro = st.secrets.get("google_genai", {}).get("model_pro", "gemini-2.5-pro")
-            self.safety = {HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE, HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE, HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE, HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE}
+            if self.api_key: 
+                genai.configure(api_key=self.api_key)
+            
+            # 2. Cấu hình Model (Ưu tiên Flash 1.5 ổn định)
+            self.model_flash = "gemini-2.5-flash" 
+            self.model_pro = "gemini-2.5-pro"
+            
+            # Nếu user cấu hình trong secrets thì dùng, không thì dùng mặc định trên
+            if "google_genai" in st.secrets:
+                self.model_flash = st.secrets["google_genai"].get("model_flash", self.model_flash)
+                self.model_pro = st.secrets["google_genai"].get("model_pro", self.model_pro)
+
+            self.safety = {
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE
+            }
             self.cache = {}
             self.initialized = True
 
-    def _generate_with_retry(self, model_name, prompt, structured_output=None):
-        if not self.api_key: return "Error: Missing API Key"
+    def _generate(self, model_name, prompt, structured_output=None):
+        if not self.api_key: return "Error: Chưa nhập API Key"
         
         gen_config = {"temperature": 0.3}
         if structured_output:
@@ -44,39 +58,47 @@ class Translator:
 
         model = genai.GenerativeModel(model_name=model_name, safety_settings=self.safety, generation_config=gen_config)
 
-        for attempt in range(5):
+        # Thử tối đa 2 lần, chờ ngắn
+        for attempt in range(2):
             try:
                 response = model.generate_content(prompt)
                 if response.text: return response.text
             except Exception as e:
-                error_msg = str(e)
-                if "429" in error_msg or "Resource has been exhausted" in error_msg:
-                    wait_time = 30 + (attempt * 10) # Chờ 30s nếu quá tải
-                    time.sleep(wait_time)
+                err = str(e)
+                # Nếu sai model (404) -> Báo lỗi ngay để đổi model
+                if "404" in err or "Not Found" in err:
+                    return f"[Model Error: Model {model_name} không tồn tại. Hãy dùng gemini-2.5-flash]"
+                
+                # Nếu quá tải (429) -> Chờ 2s rồi thử lại 1 lần
+                if "429" in err or "exhausted" in err:
+                    time.sleep(2)
                     continue
-                elif "500" in error_msg or "503" in error_msg:
-                    time.sleep(5)
-                    continue
-                else:
-                    return f"[API Error: {error_msg}]"
+                
+                return f"[API Error: {err}]"
         
-        return "[System Busy: 429 Quota Exceeded. Please try again later.]"
+        return "[System Busy: Quá tải, vui lòng thử lại sau vài giây]"
 
     def translate_text(self, text, source, target, prompt_template=None):
         if not text.strip(): return ""
         cache_key = f"{text}|{source}|{target}"
         if cache_key in self.cache: return self.cache[cache_key]
 
-        full_prompt = f"{prompt_template or 'Dịch:'}\nNguồn: {source}\nĐích: {target}\nVăn bản: {text}"
-        res = self._generate_with_retry(self.model_flash, full_prompt)
+        full_prompt = f"{prompt_template}\n\nNguồn: {source}\nĐích: {target}\nVăn bản: {text}"
         
+        # Luôn dùng Flash trước vì nó nhanh và rẻ
+        res = self._generate(self.model_flash, full_prompt)
+        
+        # Nếu Flash lỗi model, tự động fallback sang hardcode 1.5-flash
+        if "Model Error" in res:
+            res = self._generate("gemini-2.5-flash", full_prompt)
+
         if "API Error" not in res and "System Busy" not in res:
             self.cache[cache_key] = res.strip()
         return res.strip()
 
     def process_word_by_word(self, text, source, target):
         prompt = f"Phân tích từ vựng: '{text}' ({source}->{target})."
-        res = self._generate_with_retry(self.model_flash, prompt, structured_output=InteractiveTranslation)
+        res = self._generate(self.model_flash, prompt, structured_output=InteractiveTranslation)
         try:
             return [w.model_dump() for w in InteractiveTranslation.model_validate_json(res).words]
         except:
