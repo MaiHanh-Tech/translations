@@ -35,13 +35,25 @@ def show_user_interface(user_password=None):
             st.session_state.current_user = None
             st.rerun()
 
+    # Logic đăng nhập thủ công
     if user_password is None:
-        user_password = st.text_input("Enter your access key", type="password")
-        if not user_password:
-            return
-        if not pm.check_password(user_password):
-            st.error("Invalid access key")
-            return
+        # Nếu đã có trong session state thì lấy ra dùng
+        if st.session_state.get("current_user"):
+            user_password = st.session_state.current_user
+        else:
+            input_password = st.text_input("Enter your access key", type="password")
+            if not input_password:
+                return
+            
+            if not pm.check_password(input_password):
+                st.error("Invalid access key")
+                return
+            
+            # Mấu chốt sửa lỗi: Lưu ngay vào session_state khi key hợp lệ
+            user_password = input_password
+            st.session_state.user_logged_in = True
+            st.session_state.current_user = user_password
+            st.rerun() # Rerun để ẩn khung login và hiện giao diện chính
 
     st.header("Gemini AI Translator")
     
@@ -96,10 +108,14 @@ def show_user_interface(user_password=None):
         
         # Check usage (Simple char count)
         char_count = len(text_input)
-        if not pm.check_usage_limit(st.session_state.current_user, char_count):
+        
+        # Sửa lỗi: Sử dụng user_password (biến cục bộ đã được xác thực) thay vì phụ thuộc hoàn toàn vào session_state chưa cập nhật kịp trong một số trường hợp edge case
+        current_key = user_password 
+        
+        if not pm.check_usage_limit(current_key, char_count):
              st.error("Daily limit exceeded.")
              return
-        pm.track_usage(st.session_state.current_user, char_count)
+        pm.track_usage(current_key, char_count)
 
         try:
             status_text = st.empty()
@@ -142,20 +158,25 @@ def main():
     # CSS fix
     st.markdown("""<style>.stTextArea textarea {font-size: 16px !important;}</style>""", unsafe_allow_html=True)
     
-    # Session state init
+    # Session state init - Khởi tạo đầy đủ các biến cần thiết
     if 'user_logged_in' not in st.session_state:
         st.session_state.user_logged_in = False
+    if 'current_user' not in st.session_state:
+        st.session_state.current_user = None
     
-    # Login Logic (Simplified from original)
+    # Login Logic
     if not st.session_state.user_logged_in:
         url_key = st.query_params.get('key', None)
+        # Check key từ URL
         if url_key and init_password_manager() and pm.check_password(url_key):
              st.session_state.user_logged_in = True
              st.session_state.current_user = url_key
              st.rerun()
-             
+        
+        # Nếu không có URL key, hiển thị giao diện đăng nhập (bên trong hàm show_user_interface)
         show_user_interface()
     else:
+        # Nếu đã login, truyền user key vào
         show_user_interface(st.session_state.current_user)
 
 if __name__ == "__main__":
