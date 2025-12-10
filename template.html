@@ -324,39 +324,50 @@
     <script>
         let synth = window.speechSynthesis;
         let voices = [];
+        
+        // Nhận mã ngôn ngữ từ Python (ví dụ: 'zh', 'en', 'vi')
+        const TARGET_LANG_CODE = '{{voice_lang}}';
 
         function populateVoiceList() {
             voices = synth.getVoices();
             let voiceSelect = document.getElementById('voice-language');
             voiceSelect.innerHTML = '';
 
-            // 寻找首选语音
-            let yunjianVoice = voices.find(voice => 
-                voice.name.includes('Microsoft Yunjian Online (Natural)') && 
-                voice.lang.includes('zh-CN')
-            );
-            let meiJiaVoice = voices.find(voice => 
-                voice.name.toLowerCase().includes('meijia') && 
-                voice.lang.includes('zh')
-            );
-            let defaultVoice = yunjianVoice || meiJiaVoice;
+            let defaultVoice = null;
 
-            // 添加所有中文语音
+            // Lọc giọng theo ngôn ngữ nguồn
             voices.forEach(voice => {
-                if (voice.lang.includes('zh')) {
+                // Kiểm tra xem giọng có khớp với mã ngôn ngữ không
+                if (voice.lang.includes(TARGET_LANG_CODE)) {
                     let option = document.createElement('option');
                     option.textContent = voice.name + ' (' + voice.lang + ')';
                     option.setAttribute('data-name', voice.name);
                     option.setAttribute('data-lang', voice.lang);
                     
-                    // 如果是默认语音，设置为选中
-                    if (defaultVoice && voice.name === defaultVoice.name) {
-                        option.selected = true;
+                    // Logic chọn giọng mặc định thông minh hơn
+                    if (!defaultVoice) {
+                        defaultVoice = voice; // Lấy giọng đầu tiên tìm thấy làm mặc định
                     }
                     
+                    // Ưu tiên giọng Google hoặc Microsoft chất lượng cao nếu có
+                    if ((voice.name.includes('Google') || voice.name.includes('Natural')) && voice.lang.includes(TARGET_LANG_CODE)) {
+                        defaultVoice = voice;
+                    }
+
                     voiceSelect.appendChild(option);
                 }
             });
+            
+            // Set giọng mặc định
+            if (defaultVoice) {
+                const options = voiceSelect.options;
+                for(let i = 0; i < options.length; i++) {
+                    if(options[i].getAttribute('data-name') === defaultVoice.name) {
+                        voiceSelect.selectedIndex = i;
+                        break;
+                    }
+                }
+            }
         }
 
         if (speechSynthesis.onvoiceschanged !== undefined) {
@@ -370,15 +381,23 @@
 
             const utterance = new SpeechSynthesisUtterance(text);
             let voiceSelect = document.getElementById('voice-language');
-            let selectedOption = voiceSelect.selectedOptions[0];
-            let voice = voices.find(v => 
-                v.name === selectedOption.getAttribute('data-name') && 
-                v.lang === selectedOption.getAttribute('data-lang')
-            );
             
-            if (voice) {
-                utterance.voice = voice;
+            // Nếu có giọng được chọn
+            if (voiceSelect.selectedOptions.length > 0) {
+                let selectedOption = voiceSelect.selectedOptions[0];
+                let voice = voices.find(v => 
+                    v.name === selectedOption.getAttribute('data-name') && 
+                    v.lang === selectedOption.getAttribute('data-lang')
+                );
+                if (voice) {
+                    utterance.voice = voice;
+                }
+            } else {
+                // Fallback nếu không chọn được giọng (thử tìm giọng theo lang code)
+                let fallbackVoice = voices.find(v => v.lang.includes(TARGET_LANG_CODE));
+                if (fallbackVoice) utterance.voice = fallbackVoice;
             }
+            
             utterance.rate = document.getElementById('voice-speed').value;
             synth.speak(utterance);
         }
@@ -386,17 +405,25 @@
         // Initial population of voices
         window.onload = function() {
             populateVoiceList();
+            // Thử load lại sau 100ms để đảm bảo danh sách giọng đã tải xong (fix lỗi trên Chrome)
+            setTimeout(populateVoiceList, 100);
         };
 
-        // 添加句子朗读功能
         function speakSentence(text) {
             const utterance = new SpeechSynthesisUtterance(text);
             let voiceSelect = document.getElementById('voice-language');
-            let selectedOption = voiceSelect.selectedOptions[0];
-            utterance.voice = speechSynthesis.getVoices().find(v => 
-                v.name === selectedOption.getAttribute('data-name') && 
-                v.lang === selectedOption.getAttribute('data-lang')
-            );
+            
+            if (voiceSelect.selectedOptions.length > 0) {
+                let selectedOption = voiceSelect.selectedOptions[0];
+                utterance.voice = speechSynthesis.getVoices().find(v => 
+                    v.name === selectedOption.getAttribute('data-name') && 
+                    v.lang === selectedOption.getAttribute('data-lang')
+                );
+            } else {
+                 let fallbackVoice = voices.find(v => v.lang.includes(TARGET_LANG_CODE));
+                 if (fallbackVoice) utterance.voice = fallbackVoice;
+            }
+            
             utterance.rate = document.getElementById('voice-speed').value;
             speechSynthesis.speak(utterance);
         }
@@ -417,5 +444,4 @@
     {{content}}
 </body>
 
-</html>
 </html>
