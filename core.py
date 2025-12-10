@@ -1,4 +1,4 @@
-import google.generativeai as genai
+mport google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import streamlit as st
 from pypinyin import pinyin, Style
