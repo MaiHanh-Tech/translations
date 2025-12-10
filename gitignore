@@ -1,0 +1,120 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+streamlit-chinese/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Temporary files
+*.tmp
+*.temp
+temp_input.txt
+temp_input.html
+*.bak
+*.log
+
+# Project specific
+passwords.json
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# OS specific
+.DS_Store
+Thumbs.db
+*.db
+*.sqlite3
+*.sqlite
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Translation temp files
+translated_*.txt
+translated_*.html
+*.html.bak
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Misc
+*.pid
+*.seed
+*.pid.lock
+
+# VS Code and Git Extensions
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+.vsls.json
+*.code-workspace
+
+# Git Extension specific
+.gitlens/
+.git-blame-ignore-revs
+.githistory/
+.gitgraph/
+
+# Local History Extension
+.history/
+.lh/
+
+# Comparison backups
+*.orig
+*.bak
+*.old
+*_BACKUP_*
+*_BASE_*
+*_LOCAL_*
+*_REMOTE_*
+*.diff
