@@ -1,184 +1,235 @@
-import streamlit as st
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-import time
-import random
-import jieba
-from pypinyin import pinyin, Style
+import pypinyin
+import re
 import os
-from typing import List, Optional
-from pydantic import BaseModel, Field
-import json
+import sys
+import jieba
+import streamlit as st
+# Import Translator class
+from translator import Translator
 
-class WordDefinition(BaseModel):
-    word: str = Field(description="Từ gốc hoặc cụm từ")
-    pinyin: str = Field(description="Phiên âm Pinyin (nếu là tiếng Trung), hoặc để trống")
-    translation: str = Field(description="Nghĩa của từ trong ngữ cảnh này")
+# --- PROMPT DỊCH SÁCH (Theo yêu cầu) ---
+EXPERT_PROMPT = """Bạn là một chuyên gia dịch thuật và biên tập sách chuyên nghiệp. 
+Hãy phân tích và dịch đoạn văn bản sau sang ngôn ngữ đích một cách trôi chảy, giữ đúng văn phong học thuật nhưng vẫn tự nhiên và dễ hiểu.
+Yêu cầu:
+1. Giữ nguyên ý nghĩa và sắc thái của tác giả.
+2. Xử lý các thuật ngữ chuyên ngành chính xác.
+3. Nếu văn bản gốc bị ngắt dòng do lỗi PDF, hãy tự động nối ý để dịch thành câu hoàn chỉnh.
+4. Không thêm lời bình luận, chỉ trả về kết quả dịch.
+"""
 
-class InteractiveTranslation(BaseModel):
-    words: List[WordDefinition]
+def split_sentence(text: str) -> list:
+    """Split text into sentences (Logic gốc được giữ nguyên)"""
+    # Xử lý sơ bộ khoảng trắng thừa
+    text = re.sub(r'\s+', ' ', text.strip())
+    
+    # Pattern tách câu
+    pattern = r'([。！？，：；.!?,][」"』\'）)]*(?:\s*[「""『\'（(]*)?)'
+    splits = re.split(pattern, text)
 
-class Translator:
-    _instance = None
+    chunks = []
+    current_chunk = ""
+    min_length = 20
+    quote_count = 0
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance.initialized = False
-        return cls._instance
+    for i in range(0, len(splits)-1, 2):
+        if splits[i]:
+            chunk = splits[i] + (splits[i+1] if i+1 < len(splits) else '')
+            # Đếm quote (Logic của bạn)
+            quote_count += chunk.count('"') + chunk.count('"') + chunk.count('"')
+            quote_count += chunk.count('「') + chunk.count('」')
+            quote_count += chunk.count('『') + chunk.count('』')
 
-    def __init__(self):
-        if not self.initialized:
-            # Lấy API Key
-            self.api_key = st.secrets.get("google_genai", {}).get("api_key", "")
-            if not self.api_key:
-                self.api_key = st.secrets.get("api_key", "")
-            
-            if self.api_key:
-                genai.configure(api_key=self.api_key)
-            
-            self.model_pro_name = st.secrets.get("google_genai", {}).get("model_pro", "gemini-1.5-pro")
-            self.model_flash_name = st.secrets.get("google_genai", {}).get("model_flash", "gemini-1.5-flash")
-            
-            self.safety_settings = {
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            }
-
-            self.generation_config = {
-                "temperature": 0.3,
-                "top_p": 0.95,
-                "top_k": 64,
-                "max_output_tokens": 8192,
-            }
-
-            self.translated_cache = {}
-            self.initialized = True
-
-    def get_model(self, use_flash=False, structured_output=None):
-        model_name = self.model_flash_name if use_flash else self.model_pro_name
-        
-        if structured_output:
-            return genai.GenerativeModel(
-                model_name=model_name,
-                generation_config=genai.GenerationConfig(
-                    response_mime_type="application/json",
-                    response_schema=structured_output
-                ),
-                safety_settings=self.safety_settings
-            )
-        
-        return genai.GenerativeModel(
-            model_name=model_name,
-            generation_config=self.generation_config,
-            safety_settings=self.safety_settings
-        )
-
-    def _generate_with_retry(self, model, prompt, retries=3):
-        """Cơ chế thử lại khi gặp lỗi"""
-        last_error = None
-        for i in range(retries):
-            try:
-                response = model.generate_content(prompt)
-                if response.text:
-                    return response.text
-            except Exception as e:
-                error_str = str(e)
-                last_error = e
-                # Nếu lỗi 429 (Resource Exhausted) hoặc lỗi mạng thì chờ rồi thử lại
-                if "429" in error_str or "Resource has been exhausted" in error_str or "500" in error_str:
-                    wait_time = (2 ** i) + random.uniform(0, 1) # Chờ 1s, 2s, 4s...
-                    print(f"API Busy/Error. Retrying in {wait_time:.1f}s... (Attempt {i+1}/{retries})")
-                    time.sleep(wait_time)
-                    continue
+            if quote_count % 2 == 1 or (len(current_chunk) + len(chunk) < min_length and i < len(splits)-2):
+                current_chunk += chunk
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk + chunk)
+                    current_chunk = ""
                 else:
-                    # Các lỗi khác (như sai Key, Blocked) thì dừng ngay
-                    print(f"Non-retriable error: {error_str}")
-                    break
-        
-        print(f"Failed after {retries} attempts. Last error: {last_error}")
-        return None
+                    chunks.append(chunk)
+                quote_count = 0
 
-    def _generate_content_with_fallback(self, prompt, structured_output=None):
-        # Ưu tiên 1: Dùng Flash cho nhanh và rẻ (tránh lỗi quota của Pro)
-        # Nếu bạn muốn Pro, hãy đổi False thành True ở dòng dưới
+    if splits[-1] or current_chunk:
+        last_chunk = splits[-1] if splits[-1] else ""
+        if current_chunk:
+            chunks.append(current_chunk + last_chunk)
+        elif last_chunk:
+            chunks.append(last_chunk)
+
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def convert_to_pinyin(text: str) -> str:
+    """Chuyển đổi Pinyin nếu là tiếng Trung"""
+    if any('\u4e00' <= char <= '\u9fff' for char in text):
         try:
-            model = self.get_model(use_flash=True, structured_output=structured_output)
-            result = self._generate_with_retry(model, prompt)
-            if result: return result
-            
-            # Ưu tiên 2: Nếu Flash lỗi, thử sang Pro (Fallback ngược)
-            print("Flash model failed, trying Pro...")
-            model = self.get_model(use_flash=False, structured_output=structured_output)
-            result = self._generate_with_retry(model, prompt)
-            return result
-            
-        except Exception as e:
-            print(f"All models failed: {str(e)}")
-            return None
+            pinyin_list = pypinyin.pinyin(text, style=pypinyin.TONE)
+            return ' '.join([item[0] for item in pinyin_list])
+        except:
+            return ""
+    return ""
 
-    def translate_text(self, text, source_lang, target_lang, prompt_template=None):
-        if not text.strip(): return ""
+
+def process_chunk(chunk: str, index: int, translator_instance, include_english: bool, 
+                 source_lang: str, target_lang: str) -> tuple:
+    try:
+        # 1. Pinyin (chỉ tạo nếu Nguồn hoặc Đích là Trung)
+        pinyin = ""
+        if source_lang == "Chinese":
+             pinyin = convert_to_pinyin(chunk)
+
+        # 2. Dịch Anh (Tham khảo)
+        english = ""
+        if include_english:
+            if target_lang == "English":
+                english = "" # Sẽ hiện ở dòng chính
+            elif source_lang == "English":
+                english = chunk
+            else:
+                # Dịch sang Anh (ngắn gọn)
+                english = translator_instance.translate_text(
+                    chunk, source_lang, "English", 
+                    prompt_template="Translate to English accurately."
+                )
+
+        # 3. Dịch Ngôn ngữ đích (Dùng Prompt Sách)
+        second_trans = translator_instance.translate_text(
+            chunk, source_lang, target_lang,
+            prompt_template=EXPERT_PROMPT
+        )
+        
+        # Nếu Đích là Trung và chưa có Pinyin, tạo từ bản dịch
+        if target_lang == "Chinese" and not pinyin:
+            pinyin = convert_to_pinyin(second_trans)
+
+        return (index, chunk, pinyin, english, second_trans)
+
+    except Exception as e:
+        print(f"Error chunk {index}: {e}")
+        return (index, chunk, "", "[Error]", f"[Sys Error: {str(e)}]")
+
+
+def create_html_block(results: tuple, include_english: bool) -> str:
+    speak_button = '''<button class="speak-button" onclick="speakSentence(this.parentElement.textContent.replace('🔊', ''))"><svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg></button>'''
+    
+    try:
+        # Giải nén tuple (đã chuẩn hóa 5 phần tử từ process_chunk)
+        index, chunk, pinyin, english, second = results
+        
+        html = f'<div class="sentence-part responsive">'
+        html += f'<div class="original">{index + 1}. {chunk}{speak_button}</div>'
+        
+        if pinyin:
+            html += f'<div class="pinyin">{pinyin}</div>'
             
-        cache_key = f"{text}_{source_lang}_{target_lang}"
-        if cache_key in self.translated_cache:
-            return self.translated_cache[cache_key]
-
-        base_prompt = prompt_template if prompt_template else "Dịch văn bản sau."
-        full_prompt = f"""
-        {base_prompt}
-        
-        [Thông tin]
-        - Nguồn: {source_lang}
-        - Đích: {target_lang}
-        
-        [Văn bản]
-        {text}
-        
-        [Yêu cầu]
-        Chỉ trả về bản dịch.
-        """
-
-        translation = self._generate_content_with_fallback(full_prompt)
-        
-        if translation:
-            self.translated_cache[cache_key] = translation.strip()
-            return translation.strip()
-        
-        # Trả về chuỗi rỗng thay vì "[Translation Error]" để UI trông đỡ xấu nếu lỗi nhẹ
-        return "[Lỗi kết nối API - Vui lòng thử lại]"
-
-    def process_word_by_word(self, text, source_lang, target_lang):
-        prompt = f"""
-        Phân tích văn bản ({source_lang}) sang ({target_lang}).
-        Tách từ, Pinyin (nếu Trung), Nghĩa.
-        Văn bản: "{text}"
-        """
-        try:
-            model = self.get_model(use_flash=True, structured_output=InteractiveTranslation)
-            response_text = self._generate_with_retry(model, prompt)
+        if include_english and english:
+            html += f'<div class="english">{english}</div>'
             
-            if response_text:
-                result_json = json.loads(response_text)
-                return [{
-                    'word': item['word'],
-                    'pinyin': item['pinyin'],
-                    'translations': [item['translation']]
-                } for item in result_json.get('words', [])]
-            
-        except Exception as e:
-            print(f"Gemini interactive failed: {e}")
+        html += f'<div class="second-language">{second}</div>'
+        html += '</div>'
         
-        return self._fallback_local_segmentation(text)
+        return html
+    except Exception as e:
+        return f"<div>Error displaying block {results[1]}: {str(e)}</div>"
 
-    def _fallback_local_segmentation(self, text):
-        words = list(jieba.cut(text))
-        results = []
-        for word in words:
-            py = ""
-            if '\u4e00' <= word <= '\u9fff':
-                 py = ' '.join([item[0] for item in pinyin(word, style=Style.TONE)])
-            results.append({'word': word, 'pinyin': py, 'translations': []})
-        return results
+
+def create_interactive_html_block(results: tuple, include_english: bool) -> str:
+    # Logic cũ cho interactive mode
+    if isinstance(results, tuple) and len(results) == 2:
+        chunk, word_data = results
+    else:
+        return ""
+
+    content_html = '<div class="interactive-text">'
+    
+    current_paragraph = []
+    paragraphs = []
+    
+    for word in word_data:
+        if isinstance(word, dict) and word.get('word') == '\n':
+            if current_paragraph:
+                paragraphs.append(current_paragraph)
+                current_paragraph = []
+        else:
+            current_paragraph.append(word)
+    if current_paragraph: paragraphs.append(current_paragraph)
+    
+    for paragraph in paragraphs:
+        content_html += '<p class="interactive-paragraph">'
+        for word_data in paragraph:
+            if word_data.get('translations'):
+                tooltip = f"{word_data.get('pinyin', '')}\n{word_data['translations'][-1]}"
+                content_html += f'<span class="interactive-word" onclick="speak(\'{word_data["word"]}\')" data-tooltip="{tooltip}">{word_data["word"]}</span>'
+            else:
+                content_html += f'<span class="non-chinese">{word_data.get("word", "")}</span>'
+        content_html += '</p>'
+    
+    return content_html + '</div>'
+
+
+def translate_file(input_text: str, progress_callback=None, include_english=True, 
+                  source_lang="Chinese", target_lang="Vietnamese", 
+                  translation_mode="Standard Translation", processed_words=None):
+    try:
+        text = input_text.strip()
+        
+        # Khởi tạo Translator
+        translator_instance = Translator()
+
+        # Mode: Interactive
+        if translation_mode == "Interactive Word-by-Word" and processed_words:
+            with open('template.html', 'r', encoding='utf-8') as f: html_template = f.read()
+            content = create_interactive_html_block((text, processed_words), include_english)
+            return html_template.replace('{{content}}', content)
+        
+        # Mode: Standard
+        else:
+            chunks = split_sentence(text)
+            total = len(chunks)
+            translation_content = ""
+            
+            if progress_callback: progress_callback(0)
+
+            # Chạy tuần tự để ổn định
+            for i, chunk in enumerate(chunks):
+                result = process_chunk(
+                    chunk, i, 
+                    translator_instance, 
+                    include_english, source_lang, target_lang
+                )
+                translation_content += create_html_block(result, include_english)
+                
+                if progress_callback:
+                    progress_callback(min(100, ((i+1)/total)*100))
+
+            with open('template.html', 'r', encoding='utf-8') as f: 
+                html_template = f.read()
+            
+            # Script fix CSS dark mode
+            fix_css_script = """
+            <script>
+                (function() {
+                    function setTheme() {
+                        const isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+                        document.body.setAttribute('data-theme', isDark ? 'dark' : 'light');
+                    }
+                    setTheme();
+                    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', setTheme);
+                })();
+            </script>
+            </body>
+            """
+            
+            if "</body>" in html_template:
+                html_template = html_template.replace("</body>", fix_css_script)
+            else:
+                html_template += fix_css_script
+
+            return html_template.replace('{{content}}', translation_content)
+
+    except Exception as e:
+        return f"<h3>Critical Error: {str(e)}</h3>"
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        print(translate_file(open(sys.argv[1], 'r', encoding='utf-8').read()))
