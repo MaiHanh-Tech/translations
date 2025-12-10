@@ -11,3 +11,4 @@ psutil>=5.8.0
 plotly>=5.3.1
 jieba
 tenacity
+beautifulsoup4
