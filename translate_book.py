@@ -9,24 +9,32 @@ from concurrent.futures import ThreadPoolExecutor
 # Prompt chuyên gia dịch thuật
 EXPERT_PROMPT = """Bạn là biên dịch viên chuyên nghiệp. Hãy dịch đoạn văn bản sau.
 Yêu cầu quan trọng:
-1. Tự động nối các ý bị ngắt quãng do lỗi xuống dòng của PDF để dịch thành câu hoàn chỉnh.
-2. Giữ nguyên thuật ngữ chuyên ngành.
-3. Văn phong tự nhiên, mượt mà.
-4. Chỉ trả về kết quả dịch.
+1. Tự động sửa lỗi chính tả do copy từ PDF (ví dụ: nối các từ bị ngắt quãng như 'impor tant' -> 'important').
+2. Dịch thoát ý, văn phong tự nhiên, trôi chảy.
+3. Chỉ trả về kết quả dịch.
 """
 
 def clean_pdf_text(text: str) -> str:
     """Xử lý văn bản PDF bị lỗi ngắt dòng"""
-    # 1. Nối từ bị ngắt: "impor- \n tant" -> "important"
+    # 1. Nối từ bị ngắt bằng dấu gạch ngang: "impor-\ntant" -> "important"
     text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
-    # 2. Xóa xuống dòng đơn lẻ (giữ lại đoạn văn cách nhau bởi 2 dòng trống)
+    
+    # 2. [MỚI] Nối từ bị ngắt bởi khoảng trắng (lỗi PDF phổ biến): "impor tant" -> "important"
+    # Logic: Tìm chữ thường + khoảng trắng + chữ thường -> Nối lại nếu có vẻ là từ bị ngắt
+    # Regex này chỉ nối nếu ký tự liền kề là chữ cái, cẩn thận kẻo dính 2 từ đơn.
+    # Tuy nhiên, để an toàn, ta dùng Prompt của AI để fix lỗi chính tả này thay vì regex cứng có thể sai.
+    # Nhưng ta sẽ xử lý lỗi xuống dòng:
+    
+    # 3. Xóa xuống dòng đơn lẻ (nối dòng)
     text = re.sub(r'(?<!\n)\n(?!\n)', ' ', text)
-    # 3. Chuẩn hóa khoảng trắng
+    
+    # 4. Chuẩn hóa khoảng trắng
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-def split_smart_chunks(text: str, chunk_size=800) -> list:
-    """Chia văn bản thành các khối lớn (~800 ký tự) để AI hiểu ngữ cảnh"""
+def split_smart_chunks(text: str, chunk_size=1000) -> list:
+    """Chia văn bản thành các khối lớn (~1000 ký tự)"""
+    # Tách câu dựa trên dấu chấm/hỏi/than
     sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'(])', text)
     chunks = []
     current_chunk = ""
@@ -69,24 +77,25 @@ def process_chunk(chunk, index, translator, include_english, source, target):
 
         return (index, chunk, pinyin_text, eng_trans, main_trans)
     except Exception as e:
-        return (index, chunk, "", "[Error]", f"[Sys Error: {str(e)}]")
+        return (index, chunk, "", "[Error]", f"[System Error: {str(e)}]")
 
 def create_html_block(results, include_english):
-    """Tạo HTML giữ nguyên cấu trúc cũ của bạn"""
     index, chunk, pinyin, english, second = results
     
-    # Nút loa cũ
     speak_btn = '''<button class="speak-button" onclick="speakSentence(this.parentElement.textContent.replace('🔊', ''))"><svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg></button>'''
     
     html = f'<div class="sentence-part responsive">'
-    html += f'<div class="original">{index + 1}. {chunk}{speak_btn}</div>'
+    html += f'<div class="original"><strong>[{index + 1}]</strong> {chunk}{speak_btn}</div>'
     
-    if pinyin:
-        html += f'<div class="pinyin">{pinyin}</div>'
-    if include_english and english:
-        html += f'<div class="english">{english}</div>'
-        
-    html += f'<div class="second-language">{second}</div>'
+    if pinyin: html += f'<div class="pinyin">{pinyin}</div>'
+    if include_english and english: html += f'<div class="english">{english}</div>'
+    
+    # Hiển thị lỗi màu đỏ nếu có
+    if "[API Error" in second or "[System Busy" in second:
+        html += f'<div class="second-language" style="color: red; font-weight: bold;">{second}</div>'
+    else:
+        html += f'<div class="second-language">{second}</div>'
+    
     html += '</div>'
     return html
 
@@ -97,7 +106,6 @@ def create_interactive_html_block(processed_words) -> str:
         if word == '\n':
             html += '</p><p class="interactive-paragraph">'
             continue
-        # Lấy nghĩa đầu tiên
         meaning = item['translations'][0] if item['translations'] else ""
         tooltip = f"{item['pinyin']}\n{meaning}".strip()
         html += f'<span class="interactive-word" onclick="speak(\'{word}\')" data-tooltip="{tooltip}">{word}</span>'
@@ -108,32 +116,26 @@ def translate_file(input_text, progress_callback=None, include_english=True,
                   source_lang="Chinese", target_lang="Vietnamese", 
                   translation_mode="Standard Translation", processed_words=None):
     
-    # Mode 1: Interactive
     if translation_mode == "Interactive Word-by-Word" and processed_words:
         with open('template.html', 'r', encoding='utf-8') as f: template = f.read()
         content = create_interactive_html_block(processed_words)
         return template.replace('{{content}}', content)
 
-    # Mode 2: Standard (Dịch sách)
+    # Standard Translation
     translator = Translator()
-    
-    # B1: Làm sạch văn bản PDF
     clean_text = clean_pdf_text(input_text)
-    
-    # B2: Chia chunk lớn
     chunks = split_smart_chunks(clean_text)
     total = len(chunks)
     
-    html_body = '<div class="translation-block">' # Mở wrapper chính
+    html_body = '<div class="translation-block">'
     
-    # B3: Xử lý song song (Max 3 threads để tránh lỗi 429)
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    # Giảm xuống 2 workers để API ổn định hơn
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = []
         for i, chunk in enumerate(chunks):
             future = executor.submit(process_chunk, chunk, i, translator, include_english, source_lang, target_lang)
             futures.append((i, future))
         
-        # Thu thập kết quả theo thứ tự
         results = []
         completed = 0
         for i, future in futures:
@@ -146,14 +148,12 @@ def translate_file(input_text, progress_callback=None, include_english=True,
         for res in results:
             html_body += create_html_block(res, include_english)
             
-    html_body += '</div>' # Đóng wrapper
+    html_body += '</div>'
 
-    # B4: Ghép template & Fix CSS
     try:
         with open('template.html', 'r', encoding='utf-8') as f: template = f.read()
     except: template = "<body>{{content}}</body>"
     
-    # Script tự động kích hoạt theme dark/light
     css_fix = """<script>
     (function(){
         function s(){document.body.setAttribute('data-theme', window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');}
