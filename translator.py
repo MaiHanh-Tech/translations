@@ -9,7 +9,7 @@ from pypinyin import pinyin, Style
 from pydantic import BaseModel, Field
 from typing import List
 
-# --- Cấu trúc dữ liệu cho chế độ Word-by-Word ---
+# Cấu trúc dữ liệu trả về cho chế độ Word-by-Word
 class WordDefinition(BaseModel):
     word: str = Field(description="Từ gốc")
     pinyin: str = Field(description="Phiên âm (nếu có)", default="")
@@ -29,15 +29,16 @@ class Translator:
 
     def __init__(self):
         if not self.initialized:
-            # Lấy API Key an toàn từ nhiều nguồn
+            # 1. Tự động tìm API Key
             self.api_key = st.secrets.get("google_genai", {}).get("api_key", "")
             if not self.api_key:
-                self.api_key = st.secrets.get("api_key", "")
+                # Fallback: Thử tìm ở root hoặc biến môi trường
+                self.api_key = st.secrets.get("api_key", os.environ.get("GOOGLE_API_KEY", ""))
             
             if self.api_key:
                 genai.configure(api_key=self.api_key)
             
-            # Config Model
+            # 2. Cấu hình Model
             self.model_pro = st.secrets.get("google_genai", {}).get("model_pro", "gemini-1.5-pro")
             self.model_flash = st.secrets.get("google_genai", {}).get("model_flash", "gemini-1.5-flash")
             
@@ -51,11 +52,9 @@ class Translator:
             self.initialized = True
 
     def _generate_with_retry(self, model_name, prompt, structured_output=None):
-        """Gọi API với cơ chế thử lại (Retry) khi gặp lỗi mạng/quota"""
         if not self.api_key:
-            return None
+            return "Error: Chưa cấu hình API Key trong .streamlit/secrets.toml"
 
-        # Cấu hình trả về JSON nếu cần
         gen_config = {"temperature": 0.3}
         if structured_output:
             gen_config["response_mime_type"] = "application/json"
@@ -67,70 +66,64 @@ class Translator:
             generation_config=gen_config
         )
 
+        last_error = ""
+        # Thử lại tối đa 3 lần
         for attempt in range(3):
             try:
                 response = model.generate_content(prompt)
-                return response.text
+                if response.text:
+                    return response.text
             except Exception as e:
-                err = str(e)
-                # Nếu lỗi 429 (Quota) hoặc 5xx (Server), chờ rồi thử lại
-                if "429" in err or "500" in err or "503" in err:
-                    sleep_time = (2 ** attempt) + random.random()
-                    time.sleep(sleep_time)
+                last_error = str(e)
+                # Chỉ retry nếu lỗi Quota (429) hoặc Server (5xx)
+                if any(x in last_error for x in ["429", "500", "502", "503", "Resource has been exhausted"]):
+                    wait_time = (2 ** attempt) + random.uniform(1, 3)
+                    time.sleep(wait_time)
                     continue
                 else:
-                    print(f"Non-retriable error: {err}")
-                    return None
-        return None
+                    # Các lỗi khác (400 Invalid Key, 403 Permission) -> Trả về lỗi ngay
+                    return f"[API Error: {last_error}]"
+        
+        return f"[System Busy: {last_error}]"
 
     def translate_text(self, text, source_lang, target_lang, prompt_template=None):
-        """Hàm dịch chính"""
         if not text.strip(): return ""
         
-        # Check cache
+        # Cache check
         cache_key = f"{text}|{source_lang}|{target_lang}"
         if cache_key in self.cache: return self.cache[cache_key]
 
         base_prompt = prompt_template or "Dịch đoạn văn sau."
-        full_prompt = f"""
-        {base_prompt}
-        Thông tin:
-        - Nguồn: {source_lang}
-        - Đích: {target_lang}
-        - Văn bản: {text}
-        """
+        full_prompt = f"{base_prompt}\n\nThông tin:\n- Nguồn: {source_lang}\n- Đích: {target_lang}\n- Văn bản: {text}"
 
-        # Ưu tiên dùng Flash cho nhanh, nếu lỗi mới sang Pro
+        # Chiến thuật: Flash -> Pro
         result = self._generate_with_retry(self.model_flash, full_prompt)
-        if not result:
-            result = self._generate_with_retry(self.model_pro, full_prompt)
-
-        if result:
-            self.cache[cache_key] = result.strip()
-            return result.strip()
         
-        return "[Error: API Connection Failed]"
+        # Nếu Flash lỗi (khác lỗi Key), thử sang Pro
+        if "API Error" in result or "System Busy" in result:
+             # Kiểm tra nếu lỗi do Key thì không thử tiếp
+             if "400" not in result and "403" not in result:
+                 time.sleep(1)
+                 result_pro = self._generate_with_retry(self.model_pro, full_prompt)
+                 # Nếu Pro thành công thì lấy, không thì giữ lỗi cũ
+                 if "API Error" not in result_pro and "System Busy" not in result_pro:
+                     result = result_pro
+
+        if "API Error" not in result and "System Busy" not in result:
+            self.cache[cache_key] = result.strip()
+            
+        return result.strip()
 
     def process_word_by_word(self, text, source_lang, target_lang):
-        """Phân tích từ vựng (Thay thế Jieba+Azure cũ)"""
-        prompt = f"""
-        Phân tích văn bản dưới đây để học ngoại ngữ.
-        Văn bản ({source_lang}): "{text}"
-        Yêu cầu: Tách từ, cung cấp Pinyin (nếu là tiếng Trung), và nghĩa ({target_lang}).
-        """
-        
-        # Dùng Flash với Structured Output (Pydantic)
+        prompt = f"Phân tích từ vựng: '{text}' (từ {source_lang} sang {target_lang})."
         res = self._generate_with_retry(self.model_flash, prompt, structured_output=InteractiveTranslation)
         
-        if res:
-            try:
-                # Parse JSON từ Gemini
+        try:
+            if res and "Error" not in res:
                 data = InteractiveTranslation.model_validate_json(res)
                 return [w.model_dump() for w in data.words]
-            except:
-                pass
+        except: pass
         
-        # Fallback về Jieba nếu Gemini lỗi
         return self._fallback_local_segmentation(text)
 
     def _fallback_local_segmentation(self, text):
