@@ -1,10 +1,11 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import jieba
 from password_manager import PasswordManager
 from translator import Translator
 from translate_book import translate_file
 
-# Initialize password manager
+# Initialize globals
 pm = None
 
 def init_password_manager():
@@ -13,21 +14,13 @@ def init_password_manager():
         try:
             pm = PasswordManager()
             return True
-        except Exception as e:
-            st.error(f"Error initializing password manager: {str(e)}")
-            return False
+        except: return False
     return True
 
-def init_translator():
-    if 'translator' not in st.session_state:
-        st.session_state.translator = Translator()
-    return st.session_state.translator
-
 def show_user_interface(user_password=None):
-    if not init_password_manager():
-        return
+    if not init_password_manager(): return
 
-    # Logout button
+    # Logout
     col1, col2 = st.columns([10, 1])
     with col2:
         if st.button("Logout"):
@@ -35,149 +28,91 @@ def show_user_interface(user_password=None):
             st.session_state.current_user = None
             st.rerun()
 
-    # Logic đăng nhập thủ công
+    # Login Logic (Manual)
     if user_password is None:
-        # Nếu đã có trong session state thì lấy ra dùng
         if st.session_state.get("current_user"):
             user_password = st.session_state.current_user
         else:
-            input_password = st.text_input("Enter your access key", type="password")
-            if not input_password:
+            pwd = st.text_input("Enter Access Key", type="password")
+            if not pwd: return
+            if not pm.check_password(pwd):
+                st.error("Invalid Key")
                 return
-            
-            if not pm.check_password(input_password):
-                st.error("Invalid access key")
-                return
-            
-            # Mấu chốt sửa lỗi: Lưu ngay vào session_state khi key hợp lệ
-            user_password = input_password
             st.session_state.user_logged_in = True
-            st.session_state.current_user = user_password
-            st.rerun() # Rerun để ẩn khung login và hiện giao diện chính
+            st.session_state.current_user = pwd
+            st.rerun()
 
-    st.header("Gemini AI Translator")
+    # --- UI CHÍNH ---
+    st.header("Gemini Translator (PDF Optimized)")
     
-    # --- Language Settings ---
-    st.subheader("Language Settings")
-    col_src, col_tgt = st.columns(2)
-    
-    available_langs = ["Chinese", "English", "Vietnamese"]
-    
-    with col_src:
-        source_language = st.selectbox(
-            "Source Language (Ngôn ngữ nguồn)",
-            options=available_langs,
-            index=0 # Default Chinese
-        )
+    # 1. Chọn Ngôn ngữ
+    c1, c2 = st.columns(2)
+    with c1:
+        source_lang = st.selectbox("Nguồn (Source)", ["Chinese", "English", "Vietnamese"], index=1)
+    with c2:
+        target_lang = st.selectbox("Đích (Target)", ["Vietnamese", "English", "Chinese"], index=0)
+
+    # 2. Cấu hình
+    mode = st.radio("Chế độ", ["Standard Translation", "Interactive Word-by-Word"])
+    include_eng = st.checkbox("Kèm tiếng Anh (Tham khảo)", value=True) if target_lang != "English" else False
+
+    # 3. Input
+    text_input = st.text_area("Nhập văn bản (Paste từ PDF thoải mái)", height=300)
+
+    if st.button("Dịch ngay", type="primary"):
+        if not text_input.strip(): return
         
-    with col_tgt:
-        # Filter target lang to avoid same source-target
-        target_options = [l for l in available_langs if l != source_language]
-        target_language = st.selectbox(
-            "Target Language (Ngôn ngữ đích)",
-            options=target_options,
-            index=1 if source_language == "Chinese" else 0 # Default Vietnamese if Src is Chinese
-        )
-
-    # --- Mode & Options ---
-    col1, col2 = st.columns(2)
-    with col1:
-        translation_mode = st.radio(
-            "Translation Mode",
-            ["Standard Translation", "Interactive Word-by-Word"],
-            help="Standard: Dịch cả câu (có Pinyin). Interactive: Click từng từ để xem nghĩa."
-        )
-    
-    with col2:
-        include_english = st.checkbox(
-            "Include English Reference", 
-            value=(target_language != "English" and source_language != "English"),
-            help="Hiển thị thêm dòng dịch tiếng Anh tham khảo"
-        )
-
-    # --- Input ---
-    text_input = st.text_area("Input Text", height=300, placeholder="Paste text here...")
-
-    # --- Processing ---
-    if st.button("Translate", type="primary"):
-        if not text_input.strip():
-            st.warning("Please enter text.")
+        # Check quota
+        if not pm.check_usage_limit(user_password, len(text_input)):
+            st.error("Hết quota hôm nay!")
             return
-
-        translator = init_translator()
+        pm.track_usage(user_password, len(text_input))
         
-        # Check usage (Simple char count)
-        char_count = len(text_input)
+        translator = Translator()
+        prog_bar = st.progress(0)
         
-        # Sửa lỗi: Sử dụng user_password (biến cục bộ đã được xác thực) thay vì phụ thuộc hoàn toàn vào session_state chưa cập nhật kịp trong một số trường hợp edge case
-        current_key = user_password 
-        
-        if not pm.check_usage_limit(current_key, char_count):
-             st.error("Daily limit exceeded.")
-             return
-        pm.track_usage(current_key, char_count)
-
         try:
-            status_text = st.empty()
-            progress_bar = st.progress(0)
-            
-            def update_progress(p):
-                progress_bar.progress(int(p))
-                status_text.text(f"Translating... {int(p)}%")
-
-            if translation_mode == "Interactive Word-by-Word":
-                status_text.text("Analyzing words with Gemini...")
-                # Dùng Gemini xử lý toàn bộ segmentation + dịch từ
-                processed_words = translator.process_word_by_word(text_input, source_language, target_language)
-                
-                html_content = translate_file(
-                    text_input, None, False, 
-                    source_language, target_language, 
-                    translation_mode, processed_words
-                )
+            if mode == "Interactive Word-by-Word":
+                st.info("Đang phân tích từ vựng...")
+                # Gọi hàm mới trong Translator
+                words = translator.process_word_by_word(text_input, source_lang, target_lang)
+                html = translate_file(text_input, None, False, source_lang, target_lang, mode, words)
             else:
-                # Standard Mode
-                html_content = translate_file(
-                    text_input, update_progress, include_english,
-                    source_language, target_language,
-                    translation_mode
+                st.info("Đang dịch và xử lý lỗi ngắt dòng PDF...")
+                html = translate_file(
+                    text_input, 
+                    lambda p: prog_bar.progress(int(p)),
+                    include_eng,
+                    source_lang, 
+                    target_lang,
+                    mode
                 )
-
-            progress_bar.progress(100)
-            status_text.text("Completed!")
             
-            st.download_button("Download HTML", html_content, "translation.html", "text/html")
-            components.html(html_content, height=800, scrolling=True)
-
+            prog_bar.progress(100)
+            st.success("Hoàn tất!")
+            st.download_button("Tải HTML", html, "translated.html", "text/html")
+            components.html(html, height=800, scrolling=True)
+            
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"Lỗi: {e}")
 
 def main():
-    st.set_page_config(page_title="Gemini Translator", layout="centered")
+    st.set_page_config(page_title="Gemini Translate", layout="centered")
     
-    # CSS fix
-    st.markdown("""<style>.stTextArea textarea {font-size: 16px !important;}</style>""", unsafe_allow_html=True)
-    
-    # Session state init - Khởi tạo đầy đủ các biến cần thiết
-    if 'user_logged_in' not in st.session_state:
-        st.session_state.user_logged_in = False
-    if 'current_user' not in st.session_state:
-        st.session_state.current_user = None
-    
-    # Login Logic
-    if not st.session_state.user_logged_in:
-        url_key = st.query_params.get('key', None)
-        # Check key từ URL
-        if url_key and init_password_manager() and pm.check_password(url_key):
-             st.session_state.user_logged_in = True
-             st.session_state.current_user = url_key
-             st.rerun()
-        
-        # Nếu không có URL key, hiển thị giao diện đăng nhập (bên trong hàm show_user_interface)
-        show_user_interface()
-    else:
-        # Nếu đã login, truyền user key vào
+    # Init Session vars
+    if 'user_logged_in' not in st.session_state: st.session_state.user_logged_in = False
+    if 'current_user' not in st.session_state: st.session_state.current_user = None
+
+    # URL Login
+    url_key = st.query_params.get('key', None)
+    if url_key and init_password_manager() and pm.check_password(url_key):
+        st.session_state.user_logged_in = True
+        st.session_state.current_user = url_key
+
+    if st.session_state.user_logged_in:
         show_user_interface(st.session_state.current_user)
+    else:
+        show_user_interface()
 
 if __name__ == "__main__":
     main()
