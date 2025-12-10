@@ -1,0 +1,16 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Python files
+*.py text diff=python
+
+# Text files
+*.txt text
+*.md text
+*.html text
+*.toml text
+
+# Binary files
+*.png binary
+*.jpg binary
+*.pdf binary 
