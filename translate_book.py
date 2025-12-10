@@ -7,34 +7,72 @@ import streamlit as st
 import pypinyin
 from translator import Translator
 
-# Prompt chuyên gia giữ nguyên
-EXPERT_PROMPT = """Bạn là một chuyên gia dịch thuật có nhiều kinh nghiệm. Hãy dịch tài liệu dưới đây sang ngôn ngữ đích được yêu cầu.
+# Prompt chuyên gia (giữ nguyên)
+EXPERT_PROMPT = """Bạn là một chuyên gia dịch thuật. Hãy dịch đoạn văn dưới đây sang ngôn ngữ đích.
 Yêu cầu:
-1. Dịch chính xác, giữ nguyên tinh thần và sắc thái.
-2. Với thuật ngữ chuyên ngành, dịch phù hợp ngữ cảnh.
-3. Giữ nguyên các định dạng đặc biệt (số thứ tự, dấu câu).
-4. Văn phong tự nhiên, mượt mà.
+1. Dịch mượt mà, thoát ý, nối các câu lại cho tự nhiên (vì văn bản gốc có thể bị ngắt dòng do copy từ PDF).
+2. Giữ nguyên các thuật ngữ chuyên ngành.
+3. Không tự ý thêm bình luận, chỉ trả về kết quả dịch.
 """
 
-def split_sentence(text: str) -> list[str]:
-    """Tách câu giữ nguyên logic"""
-    text = re.sub(r'\s+', ' ', text.strip())
-    pattern = r'([。！？.!?\n]+(?:\s*[”"』\'）)]*)?)'
-    splits = re.split(pattern, text)
+def preprocess_pdf_text(text: str) -> list[str]:
+    """
+    Hàm tiền xử lý quan trọng:
+    1. Nối từ bị ngắt dòng (Hyphenation): 'impor-\ntant' -> 'important'
+    2. Nối dòng bị ngắt do PDF: Dòng không kết thúc bằng dấu câu sẽ được nối với dòng sau.
+    3. Tách đoạn văn dựa trên 2 dấu xuống dòng (\n\n).
+    """
+    # 1. Xử lý dấu gạch nối ở cuối dòng (Hyphenation fix)
+    # Tìm: chữ + dấu gạch ngang + xuống dòng + chữ thường -> nối lại
+    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
+    
+    # 2. Chuẩn hóa dòng:
+    # Thay thế dấu xuống dòng đơn lẻ (\n) bằng khoảng trắng, TRỪ KHI nó là dấu xuống dòng kép (\n\n - báo hiệu đoạn mới)
+    # Logic: Nếu dòng kết thúc bằng dấu câu (.!?) thì có thể là hết câu, nhưng PDF đôi khi ngắt giữa chừng.
+    # Cách an toàn nhất cho PDF khoa học: Coi \n đơn lẻ là khoảng trắng.
+    
+    # Tạm thời thay \n\n (đoạn mới) bằng một ký tự đặc biệt không dùng đến, ví dụ <PARA_BREAK>
+    text = re.sub(r'\n\s*\n', '<PARA_BREAK>', text)
+    
+    # Thay các \n còn lại (xuống dòng vô nghĩa trong câu) bằng khoảng trắng
+    text = text.replace('\n', ' ')
+    
+    # Xử lý khoảng trắng thừa
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Khôi phục đoạn văn
+    paragraphs = text.split('<PARA_BREAK>')
+    
+    # Lọc bỏ đoạn rỗng
+    return [p.strip() for p in paragraphs if p.strip()]
+
+def split_smart_chunks(text: str, max_length=600) -> list[str]:
+    """
+    Chia đoạn văn dài thành các chunks hợp lý (3-5 câu hoặc ~500-600 ký tự).
+    Không cắt vụn từng câu ngắn.
+    """
+    # Tách thành các câu cơ bản trước
+    # Regex này bắt dấu chấm câu, nhưng bỏ qua các từ viết tắt phổ biến (Mr., Dr., Fig., v.v. cần xử lý kỹ hơn nhưng tạm thời đơn giản)
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'(])', text)
     
     chunks = []
     current_chunk = ""
     
-    for part in splits:
-        current_chunk += part
-        if len(current_chunk) > 20 and any(c in current_chunk for c in "。！？.!?\n"):
-             chunks.append(current_chunk.strip())
-             current_chunk = ""
-             
+    for sentence in sentences:
+        # Nếu chunk hiện tại + câu mới < max_length -> Gom vào
+        if len(current_chunk) + len(sentence) < max_length:
+            current_chunk += sentence + " "
+        else:
+            # Nếu chunk đã có dữ liệu, đẩy vào list
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+            
+    # Đẩy chunk cuối cùng
     if current_chunk:
         chunks.append(current_chunk.strip())
         
-    return [c for c in chunks if c]
+    return chunks
 
 def convert_to_pinyin(text: str) -> str:
     if any('\u4e00' <= char <= '\u9fff' for char in text):
@@ -51,7 +89,7 @@ def process_chunk(chunk: str, index: int, source_lang: str, target_lang: str, in
     
     translator = st.session_state.translator
     
-    # 1. Xử lý Pinyin
+    # 1. Pinyin
     pinyin_text = ""
     if source_lang == "Chinese":
         pinyin_text = convert_to_pinyin(chunk)
@@ -61,7 +99,7 @@ def process_chunk(chunk: str, index: int, source_lang: str, target_lang: str, in
         chunk, source_lang, target_lang, prompt_template=EXPERT_PROMPT
     )
     
-    # Nếu đích là Trung, lấy Pinyin cho bản dịch
+    # Nếu đích là Trung, lấy Pinyin
     if target_lang == "Chinese" and not pinyin_text:
         pinyin_text = convert_to_pinyin(main_translation)
 
@@ -83,7 +121,6 @@ def process_chunk(chunk: str, index: int, source_lang: str, target_lang: str, in
         return (index, chunk, pinyin_text, main_translation)
 
 def create_html_block(results: tuple, include_english: bool) -> str:
-    # Nút loa giữ nguyên class để ăn CSS cũ
     speak_button = '''
         <button class="speak-button" onclick="speakSentence(this.parentElement.textContent.replace('🔊', ''))">
             <svg viewBox="0 0 24 24">
@@ -96,7 +133,7 @@ def create_html_block(results: tuple, include_english: bool) -> str:
         index, chunk, pinyin, english, second = results
         return f'''
             <div class="sentence-part responsive">
-                <div class="original">{index + 1}. {chunk}{speak_button}</div>
+                <div class="original"><strong>[{index + 1}]</strong> {chunk}{speak_button}</div>
                 <div class="pinyin">{pinyin}</div>
                 <div class="english">{english}</div>
                 <div class="second-language">{second}</div>
@@ -106,7 +143,7 @@ def create_html_block(results: tuple, include_english: bool) -> str:
         index, chunk, pinyin, second = results
         return f'''
             <div class="sentence-part responsive">
-                <div class="original">{index + 1}. {chunk}{speak_button}</div>
+                <div class="original"><strong>[{index + 1}]</strong> {chunk}{speak_button}</div>
                 <div class="pinyin">{pinyin}</div>
                 <div class="second-language">{second}</div>
             </div>
@@ -134,49 +171,73 @@ def translate_file(input_text: str, progress_callback, include_english,
                   source_lang="Chinese", target_lang="Vietnamese", 
                   translation_mode="Standard Translation", processed_words=None):
     
-    # 1. Chế độ tương tác
+    # Chế độ tương tác
     if translation_mode == "Interactive Word-by-Word" and processed_words:
         content = create_interactive_html_block(processed_words)
     
-    # 2. Chế độ dịch chuẩn
+    # Chế độ dịch chuẩn (Cải tiến xử lý PDF)
     else:
-        lines = input_text.split('\n')
+        # BƯỚC 1: Tiền xử lý văn bản PDF (Nối dòng, xóa gạch nối)
+        paragraphs = preprocess_pdf_text(input_text)
+        
         translation_content = ''
         global_index = 0
         all_results = []
         
+        # BƯỚC 2: Tạo các chunks lớn hơn (3-5 câu) từ các đoạn văn
+        final_chunks = []
+        # Mapping để biết chunk nào thuộc paragraph nào (để đóng khung div)
+        chunk_map = [] 
+        
+        for para_idx, para in enumerate(paragraphs):
+            # Chia đoạn văn thành các nhóm câu (mỗi nhóm ~500 ký tự)
+            sub_chunks = split_smart_chunks(para)
+            for sub in sub_chunks:
+                final_chunks.append(sub)
+                chunk_map.append(para_idx)
+
+        total_chunks = len(final_chunks)
+        
+        # BƯỚC 3: Xử lý song song
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = []
-            total_chunks = 0
-            for line_idx, line in enumerate(lines):
-                if line.strip():
-                    chunks = split_sentence(line.strip())
-                    total_chunks += len(chunks)
-                    for chunk_idx, chunk in enumerate(chunks):
-                        future = executor.submit(process_chunk, chunk, global_index, source_lang, target_lang, include_english)
-                        futures.append((line_idx, chunk_idx, future))
-                        global_index += 1
+            for i, chunk in enumerate(final_chunks):
+                future = executor.submit(
+                    process_chunk, 
+                    chunk, 
+                    global_index, 
+                    source_lang, 
+                    target_lang, 
+                    include_english
+                )
+                futures.append((i, future))
+                global_index += 1
             
             completed = 0
-            for line_idx, chunk_idx, future in futures:
+            for idx, future in futures:
                 try:
                     result = future.result()
-                    all_results.append((line_idx, chunk_idx, result))
+                    # Lưu lại: (index gốc, paragraph index, result)
+                    all_results.append((idx, chunk_map[idx], result))
+                    
                     completed += 1
                     if progress_callback and total_chunks > 0:
                         progress_callback((completed / total_chunks) * 100)
                 except Exception as e:
                     print(f"Error: {e}")
 
-        all_results.sort(key=lambda x: (x[0], x[1]))
+        # Sắp xếp lại theo thứ tự ban đầu
+        all_results.sort(key=lambda x: x[0])
 
-        current_line = -1
-        for line_idx, chunk_idx, result in all_results:
-            if line_idx != current_line:
-                if current_line != -1:
+        # BƯỚC 4: Tạo HTML
+        current_para = -1
+        for _, para_idx, result in all_results:
+            # Nếu sang đoạn văn bản gốc mới thì tạo khung mới
+            if para_idx != current_para:
+                if current_para != -1:
                     translation_content += '</div>'
                 translation_content += '<div class="translation-block">'
-                current_line = line_idx
+                current_para = para_idx
 
             translation_content += create_html_block(result, include_english)
 
@@ -185,13 +246,11 @@ def translate_file(input_text: str, progress_callback, include_english,
         
         content = translation_content
 
-    # 3. Ghép vào Template & Fix CSS
+    # Fix CSS và trả về
     try:
         with open('template.html', 'r', encoding='utf-8') as f:
             html_content = f.read()
             
-        # [QUAN TRỌNG] Script này sẽ tự động thêm data-theme="dark/light" vào body
-        # để CSS trong template.html nhận diện đúng màu sắc và icon
         fix_css_script = """
         <script>
             (function() {
